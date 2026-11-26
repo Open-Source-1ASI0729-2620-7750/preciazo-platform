@@ -1,6 +1,9 @@
 package com.preciazo.platform.shopping;
 
 import com.jayway.jsonpath.JsonPath;
+import com.preciazo.platform.iam.application.commandservices.UserCommandService;
+import com.preciazo.platform.iam.domain.model.commands.SignInCommand;
+import com.preciazo.platform.iam.domain.model.commands.SignUpCommand;
 import com.preciazo.platform.shopping.domain.model.events.ShoppingListCreated;
 import com.preciazo.platform.shopping.domain.repositories.ShoppingListRepository;
 import org.junit.jupiter.api.BeforeEach;
@@ -21,6 +24,7 @@ import org.springframework.test.web.servlet.MvcResult;
 import javax.sql.DataSource;
 import java.time.*;
 import java.util.List;
+import java.util.Objects;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.atomic.AtomicLong;
 import static org.assertj.core.api.Assertions.assertThat;
@@ -32,12 +36,15 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
 @ActiveProfiles("test")
 @Import(ShoppingListApiTest.Fixtures.class)
 class ShoppingListApiTest {
-    private static final AtomicLong OWNERS = new AtomicLong(500);
+    private static final AtomicLong SEQ = new AtomicLong(1);
     @Autowired MockMvc mvc;
     @Autowired ShoppingListRepository lists;
+    @Autowired UserCommandService users;
     @Autowired Events events;
     @Autowired DataSource dataSource;
     private long owner;
+    private String ownerToken;
+    private String otherBuyerToken;
 
     @DynamicPropertySource static void mysqlWhenExplicitlyConfigured(DynamicPropertyRegistry properties) {
         String url = System.getenv("PRECIAZO_MYSQL_TEST_URL");
@@ -52,9 +59,24 @@ class ShoppingListApiTest {
             properties.add("spring.datasource.driver-class-name", () -> "com.mysql.cj.jdbc.Driver");
         }
     }
-    @BeforeEach void newOwner() { owner = OWNERS.incrementAndGet(); events.recorded.clear(); }
-    private MvcResult create(long buyer, String payload) throws Exception {
-        return mvc.perform(post("/api/v1/shopping-lists").principal(() -> Long.toString(buyer))
+
+    private UserCommandService.AuthenticatedUser registerBuyer() {
+        long n = SEQ.incrementAndGet();
+        String email = "buyer" + n + "@test.preciazo.pe";
+        users.handle(new SignUpCommand(email, "Buyer " + n, "TestPass2026!", List.of("ROLE_BUYER")));
+        return users.handle(new SignInCommand(email, "TestPass2026!")).toOptional().orElseThrow();
+    }
+
+    @BeforeEach void newOwner() {
+        var mainBuyer = registerBuyer();
+        owner = Objects.requireNonNull(mainBuyer.user().getId());
+        ownerToken = mainBuyer.token();
+        otherBuyerToken = registerBuyer().token();
+        events.recorded.clear();
+    }
+
+    private MvcResult create(String token, String payload) throws Exception {
+        return mvc.perform(post("/api/v1/shopping-lists").header("Authorization", "Bearer " + token)
             .contentType("application/json").content(payload))
             .andExpect(status().isCreated()).andReturn();
     }
@@ -68,10 +90,10 @@ class ShoppingListApiTest {
         assertThat(events.recorded).isEmpty();
     }
     @Test void createsThenRetrievesAnOwnedListWithGeneratedIdAndSingleEvent() throws Exception {
-        var created = create(owner, "{\"currency\":\"PEN\"}"); long listId = id(created);
+        var created = create(ownerToken, "{\"currency\":\"PEN\"}"); long listId = id(created);
         assertThat(created.getResponse().getHeader("Location")).isEqualTo("/api/v1/shopping-lists/" + listId);
         assertThat(created.getResponse().getHeader("ETag")).isEqualTo("\"0\"");
-        mvc.perform(get("/api/v1/shopping-lists/" + listId).principal(() -> Long.toString(owner)))
+        mvc.perform(get("/api/v1/shopping-lists/" + listId).header("Authorization", "Bearer " + ownerToken))
             .andExpect(status().isOk()).andExpect(jsonPath("$.ownerId").value(owner))
             .andExpect(jsonPath("$.name").value("Lista 2026-11-13 23:00:00"))
             .andExpect(jsonPath("$.status").value("ACTIVE")).andExpect(jsonPath("$.currency").value("PEN"));
@@ -79,29 +101,29 @@ class ShoppingListApiTest {
         assertThat(events.recorded).containsExactly(new ShoppingListCreated(listId, owner, Instant.parse("2026-11-14T04:00:00Z")));
     }
     @Test void returnsOnlyOwnListsInStableNewestFirstOrder() throws Exception {
-        long first = id(create(owner, "{\"name\":\"First\",\"currency\":\"PEN\"}"));
-        long second = id(create(owner, "{\"name\":\"Second\",\"currency\":\"PEN\"}"));
-        create(owner + 10000, "{\"name\":\"Other buyer\",\"currency\":\"PEN\"}");
-        mvc.perform(get("/api/v1/shopping-lists").principal(() -> Long.toString(owner)))
+        long first = id(create(ownerToken, "{\"name\":\"First\",\"currency\":\"PEN\"}"));
+        long second = id(create(ownerToken, "{\"name\":\"Second\",\"currency\":\"PEN\"}"));
+        create(otherBuyerToken, "{\"name\":\"Other buyer\",\"currency\":\"PEN\"}");
+        mvc.perform(get("/api/v1/shopping-lists").header("Authorization", "Bearer " + ownerToken))
             .andExpect(status().isOk()).andExpect(jsonPath("$.length()").value(2))
             .andExpect(jsonPath("$[0].id").value(second)).andExpect(jsonPath("$[1].id").value(first));
     }
     @Test void forbidsAnotherBuyersDetailAndDistinguishesMissingResource() throws Exception {
-        long listId = id(create(owner, "{\"name\":\"Private\",\"currency\":\"PEN\"}"));
-        mvc.perform(get("/api/v1/shopping-lists/" + listId).principal(() -> Long.toString(owner + 10000)).header("Accept-Language", "es"))
+        long listId = id(create(ownerToken, "{\"name\":\"Private\",\"currency\":\"PEN\"}"));
+        mvc.perform(get("/api/v1/shopping-lists/" + listId).header("Authorization", "Bearer " + otherBuyerToken).header("Accept-Language", "es"))
             .andExpect(status().isForbidden()).andExpect(jsonPath("$.code").value("SHOPPING_FORBIDDEN"));
-        mvc.perform(get("/api/v1/shopping-lists/999999999").principal(() -> Long.toString(owner)))
+        mvc.perform(get("/api/v1/shopping-lists/999999999").header("Authorization", "Bearer " + ownerToken))
             .andExpect(status().isNotFound()).andExpect(jsonPath("$.code").value("SHOPPING_LIST_NOT_FOUND"));
     }
     @Test void invalidCurrencyAndOversizedNameDoNotPersistOrPublish() throws Exception {
         for (String payload : List.of("{\"currency\":\"XYZ\"}", "{\"currency\":\"PEN\",\"name\":\"" + "x".repeat(256) + "\"}")) {
-            mvc.perform(post("/api/v1/shopping-lists").principal(() -> Long.toString(owner)).contentType("application/json").content(payload))
+            mvc.perform(post("/api/v1/shopping-lists").header("Authorization", "Bearer " + ownerToken).contentType("application/json").content(payload))
                 .andExpect(status().isBadRequest()).andExpect(jsonPath("$.code").value("VALIDATION_ERROR"));
         }
         assertThat(lists.findAllByOwnerId(owner)).isEmpty(); assertThat(events.recorded).isEmpty();
     }
     @Test void neverUsesACallerSuppliedOwnerAsIdentity() throws Exception {
-        mvc.perform(post("/api/v1/shopping-lists").principal(() -> Long.toString(owner)).contentType("application/json")
+        mvc.perform(post("/api/v1/shopping-lists").header("Authorization", "Bearer " + ownerToken).contentType("application/json")
             .content("{\"name\":\"Spoof\",\"currency\":\"PEN\",\"ownerId\":999}"))
             .andExpect(status().isBadRequest());
         assertThat(lists.findAllByOwnerId(999)).isEmpty();
