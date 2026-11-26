@@ -43,8 +43,8 @@ public final class ProblemDetailFromApplicationErrorAssembler {
     }
 
     private HttpStatus statusFor(String code) {
-        if (code.equals("AUTHENTICATION_REQUIRED")) return HttpStatus.UNAUTHORIZED;
-        if (code.equals("SHOPPING_FORBIDDEN")) return HttpStatus.FORBIDDEN;
+        if (code.equals("AUTHENTICATION_REQUIRED") || code.equals("INVALID_CREDENTIALS")) return HttpStatus.UNAUTHORIZED;
+        if (code.equals("FORBIDDEN") || code.endsWith("_FORBIDDEN")) return HttpStatus.FORBIDDEN;
         if (code.equals("VALIDATION_ERROR")) return HttpStatus.BAD_REQUEST;
         if (code.endsWith("_NOT_FOUND")) return HttpStatus.NOT_FOUND;
         if (code.endsWith("_CONFLICT")) return HttpStatus.CONFLICT;
